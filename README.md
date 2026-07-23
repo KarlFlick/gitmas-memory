@@ -59,6 +59,18 @@ curl -sS -H "X-API-Key: $GITMAS_API_KEY" "https://gitmas.com/memory/list.php?lim
 `memory_update`, `memory_delete`, session read/list, project routing, agent
 messaging and more. Full reference: `docs/MEMORY_STANDARD.md`.
 
+## Hermes and other HTTP agents
+
+Agents that speak HTTP instead of MCP use the local gateway:
+
+```bash
+gitmas-gateway install     # starts on login, http://127.0.0.1:8765
+gitmas-gateway token       # bearer token for Authorization header
+```
+
+The installer enables this automatically when `~/.hermes` exists. Hermes
+session files are also picked up by session autosave.
+
 ## Privacy
 
 - Your data is scoped to your account server-side; the tenant is derived from

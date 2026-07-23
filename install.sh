@@ -114,7 +114,15 @@ if [ "$SKIP_MCP" -eq 0 ]; then
     "$GITMAS_HOME/bin/gitmas-mcp-install" all || warn "MCP registration incomplete — run 'gitmas-mcp-install all' manually"
 fi
 
-# --- 5. Session autosave ----------------------------------------------------
+# --- 5. HTTP gateway (Hermes and other HTTP-only agents) --------------------
+if [ -d "$HOME/.hermes" ]; then
+  say "Hermes detected — enabling local HTTP gateway"
+  GITMAS_MCP_PYTHON="$VENV/bin/python" GITMAS_HOME="$GITMAS_HOME" \
+    "$GITMAS_HOME/bin/gitmas-gateway" install || warn "gateway install failed — run 'gitmas-gateway install' manually"
+  printf '    Point Hermes memory tooling at http://127.0.0.1:8765 with the bearer token from:\n    %s\n' "$GITMAS_HOME/memory-server/http.token"
+fi
+
+# --- 6. Session autosave ----------------------------------------------------
 if [ "$SKIP_AUTOSAVE" -eq 0 ]; then
   say "Enabling session autosave (60s scan)"
   "$GITMAS_HOME/bin/sessions-autosave" install --interval 60 || warn "autosave install failed — run 'sessions-autosave install' manually"
