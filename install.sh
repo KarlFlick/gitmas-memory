@@ -128,6 +128,10 @@ if [ "$SKIP_AUTOSAVE" -eq 0 ]; then
   "$GITMAS_HOME/bin/sessions-autosave" install --interval 60 || warn "autosave install failed — run 'sessions-autosave install' manually"
 fi
 
+# --- 7. Always-inject rules layer -------------------------------------------
+GITMAS_HOME="$GITMAS_HOME" "$GITMAS_HOME/bin/gitmas-rules" apply >/dev/null 2>&1 || true
+say "Rules layer ready – add always-on rules with: gitmas-rules add \"...\""
+
 say "Done. Restart your agent CLI (Claude Code / Codex / Pi), then verify:"
 printf '    ask your agent: "store a Gitmas memory that setup works, then search for it"\n'
 printf '    or: curl -sS -H "X-API-Key: $GITMAS_API_KEY" "https://gitmas.com/memory/list.php?limit=3"\n'
