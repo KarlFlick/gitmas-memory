@@ -5,7 +5,16 @@ session history, recallable from any supported workflow, on any of your devices.
 
 ## Install
 
-One line (macOS / Linux):
+**macOS installer**: download `GitmasMemory.pkg` from the
+[releases page](https://github.com/KarlFlick/gitmas-memory/releases),
+right-click → Open (the package is not yet notarized), and after install run
+in Terminal:
+
+```bash
+gitmas-connect <your key>
+```
+
+**One line** (macOS / Linux):
 
 ```bash
 GITMAS_API_KEY=<your key> bash -c "$(curl -fsSL https://www.gitmas.com/install.sh)"
