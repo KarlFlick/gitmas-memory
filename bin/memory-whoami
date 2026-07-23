@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Show this shell's Gitmas shared-memory identity.
+set -euo pipefail
+eval "$("$HOME/.claude/bin/memory-agent-env" "$@")"
+cat <<EOF
+MEMORY_DEVICE_ROLE=$MEMORY_DEVICE_ROLE
+MEMORY_DEVICE_ID=$MEMORY_DEVICE_ID
+MEMORY_DEVICE_NAME=$MEMORY_DEVICE_NAME
+MEMORY_USER_ID=$MEMORY_USER_ID
+MEMORY_SOURCE=$MEMORY_SOURCE
+MEMORY_AGENT_ID=$MEMORY_AGENT_ID
+MEMORY_API_URL=$MEMORY_API_URL
+EOF

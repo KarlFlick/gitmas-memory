@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# sessions-watch — Gitmas session backup watcher for agent transcript dirs.
+#
+# Supports Claude Code and Pi agent transcript layouts. It periodically scans
+# configured roots, uploads encrypted backups via session-archive, and indexes
+# compact searchable session cards via session-index-mcp.py.
+#
+# Usage:
+#   sessions-watch start [root ...]       # background daemon
+#   sessions-watch stop
+#   sessions-watch status
+#   sessions-watch once [root ...]        # one scan, foreground
+#   sessions-watch run [root ...]         # loop foreground
+#
+# Env:
+#   SESSIONS_WATCH_INTERVAL=60            # seconds, Google Docs-style autosave
+#   SESSIONS_WATCH_ROOTS="dir1:dir2"      # default roots override
+#   SESSIONS_WATCH_FORCE=1                # ignore watch-state and process all files
+
+set -uo pipefail
+
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$SCRIPT_PATH" ]]; do
+  SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+  SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+  [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/session-backup-env.sh"
+
+INTERVAL="${SESSIONS_WATCH_INTERVAL:-60}"
+GITMAS_HOME="${GITMAS_HOME:-$HOME/.gitmas}"
+RUN_DIR="$GITMAS_HOME/run"
+LOG_DIR="${GITMAS_LOG_DIR:-$GITMAS_HOME/logs}"
+PID_FILE="$RUN_DIR/sessions-watch.pid"
+LOG_FILE="$LOG_DIR/sessions-watch.log"
+STATE_FILE="${GITMAS_SESSION_WATCH_STATE:-$GITMAS_HOME/sessions/watch-state.tsv}"
+ARCHIVE_BIN="$SCRIPT_DIR/session-archive"
+INDEX_BIN="$SCRIPT_DIR/session-index-mcp.py"
+PYTHON="$(gitmas_python)"
+
+mkdir -p "$RUN_DIR" "$LOG_DIR" "$(dirname "$STATE_FILE")"
+
+default_roots() {
+  if [[ -n "${SESSIONS_WATCH_ROOTS:-}" ]]; then
+    tr ':' '\n' <<<"$SESSIONS_WATCH_ROOTS"
+    return
+  fi
+  [[ -d "$HOME/.claude/projects" ]] && printf '%s\n' "$HOME/.claude/projects"
+  [[ -d "$HOME/.pi/agent/sessions" ]] && printf '%s\n' "$HOME/.pi/agent/sessions"
+  [[ -d "$HOME/.codex/sessions" ]] && printf '%s\n' "$HOME/.codex/sessions"
+  [[ -d "$HOME/.hermes/sessions" ]] && printf '%s\n' "$HOME/.hermes/sessions"
+}
+
+resolve_roots() {
+  if [[ $# -gt 0 ]]; then
+    printf '%s\n' "$@"
+  else
+    default_roots
+  fi
+}
+
+file_key() {
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum | awk '{print $1}'
+  else
+    printf '%s' "$1" | sha1sum | awk '{print $1}'
+  fi
+}
+
+file_sig() {
+  local f="$1" size mtime
+  size="$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null || echo 0)"
+  mtime="$(stat -f%m "$f" 2>/dev/null || stat -c%Y "$f" 2>/dev/null || echo 0)"
+  printf '%s:%s\n' "$size" "$mtime"
+}
+
+state_sig() {
+  local key="$1"
+  grep "^${key} " "$STATE_FILE" 2>/dev/null | tail -1 | awk '{print $2}'
+}
+
+remember_state() {
+  local key="$1" sig="$2" path="$3"
+  mkdir -p "$(dirname "$STATE_FILE")"
+  if [[ -f "$STATE_FILE" ]]; then
+    grep -v "^${key} " "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
+    mv "${STATE_FILE}.tmp" "$STATE_FILE"
+  fi
+  printf '%s %s %s\n' "$key" "$sig" "$path" >> "$STATE_FILE"
+}
+
+scan_once() {
+  local roots=("$@")
+  local root f key sig last out rc idx total=0 archived=0 skipped=0 unchanged=0 failed=0 indexed=0 updated=0 exists=0 index_skipped=0
+  gitmas_source_secrets
+  echo "=== sessions-watch scan $(date '+%Y-%m-%d %H:%M:%S %Z') interval=${INTERVAL}s ==="
+  for root in "${roots[@]}"; do
+    [[ -d "$root" ]] || { echo "root missing: $root"; continue; }
+    echo "root: $root"
+    while IFS= read -r -d '' f; do
+      total=$((total+1))
+      key="$(file_key "$f")"
+      sig="$(file_sig "$f")"
+      last="$(state_sig "$key")"
+      if [[ "${SESSIONS_WATCH_FORCE:-}" != "1" && -n "$last" && "$last" == "$sig" ]]; then
+        unchanged=$((unchanged+1))
+        continue
+      fi
+
+      out=$("$ARCHIVE_BIN" "$f" 2>&1)
+      rc=$?
+      if [[ $rc -eq 0 ]]; then
+        if [[ "$out" == *uploaded* ]]; then archived=$((archived+1)); echo "  archive $out"; fi
+        if [[ "$out" == *skip* ]]; then skipped=$((skipped+1)); fi
+      else
+        failed=$((failed+1)); echo "  archive FAIL $f :: $out"
+      fi
+
+      idx=$("$PYTHON" "$INDEX_BIN" "$f" 2>&1)
+      if [[ "$idx" == *" index "* || "$idx" == index* ]]; then
+        indexed=$((indexed+1)); echo "  $idx"
+      elif [[ "$idx" == *" update "* || "$idx" == update* ]]; then
+        updated=$((updated+1)); echo "  $idx"
+      elif [[ "$idx" == *" exists "* || "$idx" == exists* ]]; then
+        exists=$((exists+1))
+      elif [[ "$idx" == *" skip "* || "$idx" == skip* ]]; then
+        index_skipped=$((index_skipped+1))
+      elif [[ "$idx" == *"ERROR"* ]]; then
+        failed=$((failed+1)); echo "  index FAIL $f :: $idx"
+      fi
+
+      if [[ $rc -eq 0 && "$idx" != *"ERROR"* ]]; then
+        remember_state "$key" "$sig" "$f"
+      fi
+    done < <(find "$root" \( -name '*.jsonl' -o -name 'session_*.json' \) -not -path '*/subagents/*' -print0 2>/dev/null | sort -z)
+  done
+  echo "summary: files=$total changed=$((total-unchanged)) unchanged=$unchanged uploaded=$archived archive_skipped=$skipped indexed=$indexed updated=$updated exists=$exists index_skipped=$index_skipped failed=$failed"
+}
+
+is_running() {
+  [[ -f "$PID_FILE" ]] || return 1
+  local pid; pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+cmd="${1:-status}"
+shift || true
+case "$cmd" in
+  once)
+    roots=()
+    while IFS= read -r r; do roots+=("$r"); done < <(resolve_roots "$@")
+    scan_once "${roots[@]}"
+    ;;
+  run)
+    roots=()
+    while IFS= read -r r; do roots+=("$r"); done < <(resolve_roots "$@")
+    echo $$ > "$PID_FILE"
+    trap 'rm -f "$PID_FILE"; exit 0' INT TERM EXIT
+    while true; do
+      scan_once "${roots[@]}"
+      sleep "$INTERVAL"
+    done
+    ;;
+  start)
+    if is_running; then
+      echo "sessions-watch already running pid=$(cat "$PID_FILE")"
+      exit 0
+    fi
+    nohup "$0" run "$@" >>"$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+    echo "sessions-watch started pid=$! log=$LOG_FILE"
+    ;;
+  stop)
+    if is_running; then
+      pid="$(cat "$PID_FILE")"
+      kill "$pid" 2>/dev/null || true
+      rm -f "$PID_FILE"
+      echo "sessions-watch stopped pid=$pid"
+    else
+      rm -f "$PID_FILE"
+      echo "sessions-watch not running"
+    fi
+    ;;
+  status)
+    if is_running; then
+      echo "sessions-watch running pid=$(cat "$PID_FILE") log=$LOG_FILE"
+    else
+      echo "sessions-watch not running"
+      exit 1
+    fi
+    ;;
+  *)
+    echo "usage: sessions-watch {start|stop|status|once|run} [root ...]" >&2
+    exit 64
+    ;;
+esac

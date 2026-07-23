@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# session-archive-on-stop: Stop hook entry point.
+# Archives the just-finished session jsonl (encrypted upload to gitmas) and
+# creates an MCP card for it. Idempotent — safe to re-run.
+#
+# Stop hook input on stdin contains the session id; we resolve the path from
+# /tmp/claude-{uid}/{cwd-hash}/{session-id}/ or by scanning ~/.claude/projects/
+# for the matching jsonl.
+#
+# Errors are silenced so a hook failure cannot break the user's CLI session.
+
+set -uo pipefail
+
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$SCRIPT_PATH" ]]; do
+  SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+  SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+  [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/session-backup-env.sh"
+
+PYTHON="$(gitmas_python)"
+ARCHIVE_BIN="$SCRIPT_DIR/session-archive"
+INDEX_BIN="$SCRIPT_DIR/session-index-mcp.py"
+
+# Read stdin JSON to find the session id.
+INPUT="$(cat)"
+SESSION_ID="$(echo "$INPUT" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('session_id', ''))
+except Exception:
+    print('')
+" 2>/dev/null)"
+
+if [[ -z "$SESSION_ID" ]]; then
+  exit 0  # cannot proceed silently
+fi
+
+# Locate the jsonl file (cwd-hashed dir varies across sessions).
+JSONL=$(find "$HOME/.claude/projects" -maxdepth 2 -name "${SESSION_ID}.jsonl" -not -path "*/subagents/*" 2>/dev/null | head -1)
+if [[ -z "$JSONL" || ! -f "$JSONL" ]]; then
+  exit 0
+fi
+
+# Source secrets for MEMORY_API_KEY (sub-scripts also read it).
+gitmas_source_secrets
+
+LOG_DIR="${GITMAS_LOG_DIR:-$HOME/.gitmas/logs}"
+mkdir -p "$LOG_DIR"
+
+# 1) Encrypted backup. Failure here is logged but does not block step 2.
+"$ARCHIVE_BIN" "$JSONL" >>"$LOG_DIR/session-archive.log" 2>&1 || true
+
+# 2) MCP card.
+"$PYTHON" "$INDEX_BIN" "$JSONL" >>"$LOG_DIR/session-index.log" 2>&1 || true
+
+exit 0

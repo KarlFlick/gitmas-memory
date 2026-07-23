@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# heartbeat — ping the memory API so this device + session show up as
+# "active now" on gitmas.com/checkpoints.
+#
+# Usage:
+#   heartbeat [note]
+#
+# Reads:
+#   MEMORY_API_KEY from ~/.secrets (preferred) or env
+#   device_id    from Gitmas identity/env (fallback: hostname)
+#   device_name  from Gitmas identity/env (fallback: scutil / hostname)
+#   session_id   from CLAUDE_SESSION_ID env (fallback: $(tty) hash)
+#   project_dir  from $PWD
+
+set -eu
+
+NOTE="${1:-}"
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_PATH" ]; do
+  SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+  SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+  [ "${SCRIPT_PATH#/}" = "$SCRIPT_PATH" ] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/session-backup-env.sh"
+API_URL="$(gitmas_api_url sessions-heartbeat.php)"
+KEY="$(gitmas_memory_api_key)"
+if [ -z "$KEY" ]; then
+    echo "heartbeat: no MEMORY_API_KEY" >&2
+    exit 1
+fi
+
+DEVICE_ID="$(gitmas_device_id)"
+DEVICE_NAME="$(gitmas_device_name)"
+
+SESSION_ID="${CLAUDE_SESSION_ID:-$(tty 2>/dev/null | md5sum 2>/dev/null | cut -c1-16 || echo "${RANDOM}${RANDOM}")}"
+
+# Resolve project_dir with this priority:
+#   1. cwd field from hook stdin JSON (Claude Code provides session_id + cwd)
+#   2. CLAUDE_PROJECT_DIR env var (if set by future Claude Code versions)
+#   3. $PWD as last resort (leaks Bash-tool cd's into hook context — wrong
+#      when current shell drifted into a subdir for git commits etc.)
+HOOK_CWD=""
+HOOK_SID=""
+if [ -t 0 ]; then
+    : # no stdin (manual invocation) — leave HOOK_CWD empty
+else
+    HOOK_PAYLOAD=$(cat 2>/dev/null || true)
+    # Debug: capture last received stdin so we can audit hook payload shape
+    if [ -n "$HOOK_PAYLOAD" ]; then
+        LOG_DIR="${GITMAS_LOG_DIR:-$HOME/.gitmas/logs}"
+        mkdir -p "$LOG_DIR" 2>/dev/null || true
+        printf '%s\n---\n' "$HOOK_PAYLOAD" > "$LOG_DIR/heartbeat-stdin.last" 2>/dev/null || true
+    fi
+    if [ -n "$HOOK_PAYLOAD" ]; then
+        HOOK_CWD=$(printf '%s' "$HOOK_PAYLOAD" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('cwd', ''))
+except Exception:
+    pass
+" 2>/dev/null || true)
+        HOOK_SID=$(printf '%s' "$HOOK_PAYLOAD" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('session_id', ''))
+except Exception:
+    pass
+" 2>/dev/null || true)
+    fi
+fi
+PROJECT_DIR="${HOOK_CWD:-${CLAUDE_PROJECT_DIR:-${PWD:-$HOME}}}"
+[ -n "$HOOK_SID" ] && SESSION_ID="$HOOK_SID"
+
+# Map the owning CLI process PID → session id, so sibling child processes
+# (MCP servers) can resolve the real session id with 100% accuracy even when
+# several sessions run concurrently on this device.
+if [ -n "$HOOK_SID" ]; then
+    MAP_DIR="$HOME/.gitmas/session-map"
+    mkdir -p "$MAP_DIR" 2>/dev/null || true
+    MAP_PID=$$
+    for _ in 1 2 3 4 5 6 7 8; do
+        MAP_PID=$(ps -o ppid= -p "$MAP_PID" 2>/dev/null | tr -d ' ') || break
+        if [ -z "$MAP_PID" ] || [ "$MAP_PID" -le 1 ]; then break; fi
+        MAP_CMD=$(ps -o comm= -p "$MAP_PID" 2>/dev/null || true)
+        case "$MAP_CMD" in
+            *claude*|*node*|*bun*|*pi|*codex*)
+                printf '{"session_id":"%s","cwd":"%s","ts":"%s"}\n' \
+                    "$HOOK_SID" "$PROJECT_DIR" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                    > "$MAP_DIR/$MAP_PID.json" 2>/dev/null || true
+                ;;
+        esac
+    done
+    find "$MAP_DIR" -name '*.json' -mtime +7 -delete 2>/dev/null || true
+fi
+
+PAYLOAD=$(python3 -c '
+import json, sys
+print(json.dumps({
+    "device_id":   sys.argv[1],
+    "device_name": sys.argv[2],
+    "session_id":  sys.argv[3],
+    "project_dir": sys.argv[4],
+    "note":        sys.argv[5],
+}))
+' "$DEVICE_ID" "$DEVICE_NAME" "$SESSION_ID" "$PROJECT_DIR" "$NOTE")
+
+curl -s -o /dev/null -w "%{http_code}" \
+    -X POST "$API_URL" \
+    -H "X-API-Key: $KEY" \
+    -H "Content-Type: application/json" \
+    -d "$PAYLOAD" \
+    -m 5
+echo

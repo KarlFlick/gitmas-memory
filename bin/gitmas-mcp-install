@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# Install/register the local Gitmas MCP memory server for supported agents.
+set -euo pipefail
+
+GITMAS_HOME="${GITMAS_HOME:-$HOME/.gitmas}"
+SERVER="$GITMAS_HOME/memory-server/server.py"
+DEFAULT_VENV_PYTHON="$GITMAS_HOME/memory-server/.venv/bin/python"
+if [[ -n "${GITMAS_MCP_PYTHON:-}" ]]; then
+  PYTHON_BIN="$GITMAS_MCP_PYTHON"
+elif [[ -x "$DEFAULT_VENV_PYTHON" ]]; then
+  PYTHON_BIN="$DEFAULT_VENV_PYTHON"
+else
+  PYTHON_BIN="python3"
+fi
+
+usage() {
+  cat <<'EOF'
+Usage: gitmas-mcp-install [all|claude|codex ...]
+
+Registers the local Gitmas MCP memory server with supported clients.
+With no arguments, installs for every available supported client.
+
+Environment:
+  GITMAS_HOME              Gitmas product home (default: ~/.gitmas)
+  GITMAS_MCP_PYTHON        Python interpreter with the mcp package installed
+  GITMAS_CODEX_AGENT_ID    Codex Gitmas Memory agent id (default: codex)
+EOF
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+  esac
+done
+
+if [[ ! -f "$SERVER" ]]; then
+  echo "Missing $SERVER. Run: ~/gitmas-config/setup.sh" >&2
+  exit 1
+fi
+
+if ! "$PYTHON_BIN" - <<'PY' >/dev/null 2>&1
+import mcp
+PY
+then
+  cat >&2 <<'EOF'
+Python package 'mcp' is missing.
+
+Debian/Android setup:
+  apt-get update
+  apt-get install -y python3-pip python3-venv
+  python3 -m pip install --break-system-packages mcp
+
+Production recommendation:
+  create a dedicated Gitmas venv and set GITMAS_MCP_PYTHON to that python.
+EOF
+  exit 2
+fi
+
+install_claude() {
+  if ! command -v claude >/dev/null 2>&1; then
+    echo "Skipping Claude Code: 'claude' command not found." >&2
+    return 0
+  fi
+
+  claude mcp remove gitmas-memory >/dev/null 2>&1 || true
+  claude mcp add -s user gitmas-memory -- "$PYTHON_BIN" "$SERVER"
+  claude mcp list
+}
+
+install_codex() {
+  if ! command -v codex >/dev/null 2>&1; then
+    echo "Skipping Codex: 'codex' command not found." >&2
+    return 0
+  fi
+
+  local agent_id="${GITMAS_CODEX_AGENT_ID:-codex}"
+  codex mcp remove gitmas-memory >/dev/null 2>&1 || true
+  codex mcp add gitmas-memory \
+    --env "GITMAS_SOURCE=codex" \
+    --env "GITMAS_AGENT_SOURCE=codex" \
+    --env "GITMAS_AGENT_ID=$agent_id" \
+    --env "MEMORY_SOURCE=codex" \
+    --env "MEMORY_AGENT_SOURCE=codex" \
+    --env "MEMORY_AGENT_ID=$agent_id" \
+    -- "$PYTHON_BIN" "$SERVER"
+  codex mcp list
+}
+
+clients=("$@")
+if [[ ${#clients[@]} -eq 0 ]]; then
+  clients=()
+  command -v claude >/dev/null 2>&1 && clients+=("claude")
+  command -v codex >/dev/null 2>&1 && clients+=("codex")
+  if [[ ${#clients[@]} -eq 0 ]]; then
+    echo "No supported MCP clients found. Install Claude Code or Codex first." >&2
+    exit 3
+  fi
+fi
+
+for client in "${clients[@]}"; do
+  case "$client" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    all)
+      install_claude
+      install_codex
+      ;;
+    claude|claude-code)
+      install_claude
+      ;;
+    codex)
+      install_codex
+      ;;
+    *)
+      echo "Unknown client: $client" >&2
+      usage >&2
+      exit 4
+      ;;
+  esac
+done

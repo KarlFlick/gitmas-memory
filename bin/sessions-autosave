@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# sessions-autosave: keep Gitmas full-session saves running continuously.
+#
+# Goal: Google Docs-style safety. The watcher scans agent transcript folders in
+# the background, uploads encrypted session archives whenever a transcript grows,
+# and indexes searchable session cards. Closing a terminal should not be the
+# event that decides whether the session is saved.
+#
+# Usage:
+#   sessions-autosave install [--interval 60]
+#   sessions-autosave start [--interval 60]
+#   sessions-autosave stop
+#   sessions-autosave restart [--interval 60]
+#   sessions-autosave status
+#   sessions-autosave once
+#   sessions-autosave tail
+
+set -euo pipefail
+
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$SCRIPT_PATH" ]]; do
+  SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+  SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+  [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+WATCH_BIN="$SCRIPT_DIR/sessions-watch"
+GITMAS_HOME="${GITMAS_HOME:-$HOME/.gitmas}"
+LOG_DIR="${GITMAS_LOG_DIR:-$GITMAS_HOME/logs}"
+RUN_DIR="$GITMAS_HOME/run"
+LABEL="com.gitmas.sessions-watch"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+DEFAULT_INTERVAL="${SESSIONS_AUTOSAVE_INTERVAL:-60}"
+
+mkdir -p "$LOG_DIR" "$RUN_DIR"
+
+usage() {
+  sed -n '2,18p' "$0" >&2
+  exit 64
+}
+
+parse_interval() {
+  local interval="$DEFAULT_INTERVAL"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --interval)
+        shift
+        [[ $# -gt 0 ]] || usage
+        interval="$1"
+        ;;
+      --interval=*)
+        interval="${1#*=}"
+        ;;
+      *)
+        ;;
+    esac
+    shift || true
+  done
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval="$DEFAULT_INTERVAL"
+  if [[ "$interval" -lt 15 ]]; then interval=15; fi
+  printf '%s\n' "$interval"
+}
+
+write_launchd_plist() {
+  local interval="$1"
+  mkdir -p "$(dirname "$PLIST")"
+  cat > "$PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$WATCH_BIN</string>
+    <string>run</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>GITMAS_HOME</key>
+    <string>$GITMAS_HOME</string>
+    <key>SESSIONS_WATCH_INTERVAL</key>
+    <string>$interval</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.claude/bin:$HOME/.gitmas/bin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$LOG_DIR/sessions-watch.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>$LOG_DIR/sessions-watch.launchd.err</string>
+</dict>
+</plist>
+PLIST
+}
+
+is_macos() { [[ "$(uname -s 2>/dev/null || true)" == "Darwin" ]]; }
+
+launchd_bootout() {
+  launchctl bootout "gui/$UID" "$PLIST" >/dev/null 2>&1 || true
+}
+
+launchd_bootstrap() {
+  launchctl bootstrap "gui/$UID" "$PLIST" >/dev/null 2>&1 || launchctl kickstart -k "gui/$UID/$LABEL" >/dev/null 2>&1 || true
+  launchctl kickstart -k "gui/$UID/$LABEL" >/dev/null 2>&1 || true
+}
+
+install_macos() {
+  local interval="$1"
+  write_launchd_plist "$interval"
+  launchd_bootout
+  launchd_bootstrap
+  echo "sessions-autosave installed label=$LABEL interval=${interval}s plist=$PLIST"
+  "$WATCH_BIN" status || true
+}
+
+start_fallback() {
+  local interval="$1"
+  SESSIONS_WATCH_INTERVAL="$interval" "$WATCH_BIN" start
+}
+
+cmd="${1:-status}"
+shift || true
+case "$cmd" in
+  install)
+    interval="$(parse_interval "$@")"
+    if is_macos; then install_macos "$interval"; else start_fallback "$interval"; fi
+    ;;
+  start)
+    interval="$(parse_interval "$@")"
+    if is_macos && [[ -f "$PLIST" ]]; then
+      launchd_bootstrap
+      echo "sessions-autosave started via launchd label=$LABEL"
+    else
+      start_fallback "$interval"
+    fi
+    ;;
+  stop)
+    if is_macos; then launchd_bootout; fi
+    "$WATCH_BIN" stop || true
+    echo "sessions-autosave stopped"
+    ;;
+  restart)
+    interval="$(parse_interval "$@")"
+    "$0" stop >/dev/null 2>&1 || true
+    "$0" install --interval "$interval"
+    ;;
+  status)
+    if is_macos && [[ -f "$PLIST" ]]; then
+      if launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; then
+        echo "launchd: running label=$LABEL plist=$PLIST"
+      else
+        echo "launchd: not loaded label=$LABEL plist=$PLIST"
+      fi
+    fi
+    "$WATCH_BIN" status || true
+    ;;
+  once)
+    "$WATCH_BIN" once "$@"
+    ;;
+  tail)
+    tail -80 "$LOG_DIR/sessions-watch.log" 2>/dev/null || true
+    tail -40 "$LOG_DIR/sessions-watch.launchd.err" 2>/dev/null || true
+    ;;
+  *)
+    usage
+    ;;
+esac

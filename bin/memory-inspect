@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Diagnose what memory stores live on this device.
+
+Checks the new unified SQLite, the older ChromaDB, and any
+file-based memory under ~/.claude/projects/.../memory/. Prints a
+summary that a migration script can act on.
+"""
+
+import os
+import sqlite3
+from pathlib import Path
+
+HOME = Path(os.path.expanduser("~"))
+UNIFIED = Path(os.environ.get("GITMAS_MEMORY_DB", os.environ.get("MEMORY_DB_PATH", HOME / ".gitmas/memory/unified.db"))).expanduser()
+CHROMA = HOME / ".claude/memory-db/chroma.sqlite3"
+PROJECTS = HOME / ".claude/projects"
+
+
+def banner(title: str) -> None:
+    print("\n" + "═" * 60)
+    print(title)
+    print("═" * 60)
+
+
+def probe_unified() -> None:
+    banner("unified.db (new)")
+    if not UNIFIED.exists():
+        print(f"  missing: {UNIFIED}")
+        return
+    c = sqlite3.connect(str(UNIFIED))
+    try:
+        n_total = c.execute("SELECT count(*) FROM memories").fetchone()[0]
+        n_alive = c.execute("SELECT count(*) FROM memories WHERE deleted=0").fetchone()[0]
+        print(f"  path: {UNIFIED}  ({UNIFIED.stat().st_size // 1024} KB)")
+        print(f"  rows: {n_total} total, {n_alive} non-deleted")
+    except Exception as e:
+        print(f"  probe error: {e}")
+    finally:
+        c.close()
+
+
+def probe_chroma() -> None:
+    banner("chroma.sqlite3 (old)")
+    if not CHROMA.exists():
+        print(f"  missing: {CHROMA}")
+        return
+    c = sqlite3.connect(str(CHROMA))
+    try:
+        print(f"  path: {CHROMA}  ({CHROMA.stat().st_size // 1024} KB)")
+        tables = [r[0] for r in c.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        )]
+        print(f"  tables: {len(tables)}")
+        for t in tables:
+            try:
+                n = c.execute(f'SELECT count(*) FROM "{t}"').fetchone()[0]
+                if n > 0:
+                    print(f"    {t}: {n}")
+            except Exception:
+                pass
+        # Chroma stores the actual records in `embeddings` / `embedding_metadata`.
+        try:
+            sample = c.execute(
+                "SELECT key, string_value FROM embedding_metadata WHERE key IN "
+                "('description','type','source','chroma:document') LIMIT 20"
+            ).fetchall()
+            if sample:
+                print("  metadata sample (first rows):")
+                for k, v in sample[:10]:
+                    s = (v or "")[:70].replace("\n", " ")
+                    print(f"    {k}: {s}")
+        except Exception:
+            pass
+    finally:
+        c.close()
+
+
+def probe_projects() -> None:
+    banner("file-based memory (~/.claude/projects/*/memory)")
+    if not PROJECTS.exists():
+        print(f"  missing: {PROJECTS}")
+        return
+    total_files = 0
+    per_project = []
+    for sub in sorted(PROJECTS.iterdir()):
+        mem_dir = sub / "memory"
+        if not mem_dir.is_dir():
+            continue
+        files = [f for f in mem_dir.iterdir()
+                 if f.is_file() and f.suffix == ".md" and f.name != "MEMORY.md"]
+        if files:
+            per_project.append((sub.name, len(files)))
+            total_files += len(files)
+    print(f"  projects with memory files: {len(per_project)}")
+    for name, n in per_project:
+        print(f"    {name}: {n} files")
+    print(f"  total .md files: {total_files}")
+
+
+def main() -> int:
+    import platform, socket
+    print(f"host: {socket.gethostname()}  platform: {platform.system()} {platform.release()}")
+    probe_unified()
+    probe_chroma()
+    probe_projects()
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

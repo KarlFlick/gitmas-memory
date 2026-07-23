@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# session-archive: gzip + age-encrypt + upload one session jsonl to gitmas.com
+#
+# Usage:
+#   session-archive <path-to-session.jsonl>
+#
+# Requires MEMORY_API_KEY (from env or ~/.secrets). Optional overrides:
+#   GITMAS_API_URL / MEMORY_API_URL
+#   SESSION_ARCHIVE_DEVICE_ID / SESSION_ARCHIVE_DEVICE_NAME
+#
+# Public age key is hardcoded — the matching private key lives only on Karl's
+# devices (~/.age/mas.key) + Apple Notes locked backup. Server can ENCRYPT
+# (via this client) but never DECRYPT.
+
+set -euo pipefail
+
+# Public key for encryption. Resolution order:
+#   1. GITMAS_AGE_PUBKEY env
+#   2. ~/.gitmas/identity/age.pub (written by the customer installer)
+#   3. legacy hardcoded key (Karl's devices; private key in ~/.age/mas.key)
+AGE_PUBKEY="${GITMAS_AGE_PUBKEY:-}"
+if [[ -z "$AGE_PUBKEY" && -f "$HOME/.gitmas/identity/age.pub" ]]; then
+  AGE_PUBKEY="$(head -1 "$HOME/.gitmas/identity/age.pub" | tr -d '[:space:]')"
+fi
+[[ -z "$AGE_PUBKEY" ]] && AGE_PUBKEY="age1mj7kru9duvqnm75m92yc86xt9v0gefhf0336rkddyh79m7ykdv6suy6dqu"
+
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$SCRIPT_PATH" ]]; do
+  SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+  SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+  [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/session-backup-env.sh"
+
+API="$(gitmas_api_url sessions-upload.php)"
+CHUNK_API="$(gitmas_api_url sessions-upload-chunk.php)"
+DEVICE_ID="$(gitmas_device_id)"
+DEVICE_NAME="$(gitmas_device_name)"
+
+usage() {
+  echo "usage: session-archive <path-to-session.jsonl>" >&2
+  exit 64
+}
+
+[[ $# -eq 1 ]] || usage
+JSONL="$1"
+[[ -f "$JSONL" ]] || { echo "not found: $JSONL" >&2; exit 1; }
+
+# Derive metadata from path. Supported layouts include:
+#   ~/.claude/projects/<project_dir>/<session_id>.jsonl
+#   ~/.pi/agent/sessions/<project_dir>/<timestamp>_<session_id>.jsonl
+#   ~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<session_id>.jsonl
+BASENAME="$(basename "$JSONL" .jsonl)"
+SESSION_ID="$BASENAME"
+if [[ "$BASENAME" =~ ([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$ ]]; then
+  SESSION_ID="${BASH_REMATCH[1]}"
+fi
+PROJECT_DIR="$(basename "$(dirname "$JSONL")")"
+if [[ "$JSONL" == *"/.codex/sessions/"* ]]; then
+  CODEX_CWD=$(python3 - "$JSONL" <<'PY' 2>/dev/null || true
+import json, re, sys
+cwd = ""
+with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+    for line in f:
+        try: e = json.loads(line)
+        except Exception: continue
+        if e.get("type") == "session_meta" and isinstance(e.get("payload"), dict):
+            cwd = e["payload"].get("cwd") or ""
+            break
+base = cwd.strip("/").replace("/", "-") or "root"
+base = re.sub(r"[^A-Za-z0-9_-]", "-", base)[:220]
+print("codex-" + base)
+PY
+)
+  [[ -n "$CODEX_CWD" ]] && PROJECT_DIR="$CODEX_CWD"
+fi
+#   ~/.hermes/sessions/session_YYYYMMDD_HHMMSS_<hex>.json (single JSON doc)
+if [[ "$JSONL" == *"/.hermes/sessions/"* ]]; then
+  BASENAME="$(basename "$JSONL" .json)"
+  SESSION_ID="${BASENAME#session_}"
+  SESSION_ID="${SESSION_ID//_/-}"   # 20260603-125519-5d3254 — fits API sanitizers
+  PROJECT_DIR="hermes"
+fi
+ORIGINAL_SIZE="$(stat -f%z "$JSONL" 2>/dev/null || stat -c%s "$JSONL")"
+
+# Sanity check: session_id should be uuid-like (claude/pi/codex) or the
+# hermes timestamp-hash form
+if ! [[ "$SESSION_ID" =~ ^[a-f0-9-]{22,36}$ ]]; then
+  echo "skip: $SESSION_ID does not look like a session id" >&2
+  exit 0
+fi
+
+# Source secrets to get API key (must be set in env or ~/.secrets sourced).
+# Prefer canonical GITMAS_API_KEY; keep MEMORY_API_KEY as compatibility.
+if ! gitmas_export_api_key_aliases; then
+  echo "GITMAS_API_KEY/MEMORY_API_KEY not set (source ~/.secrets first)" >&2
+  exit 2
+fi
+API_KEY="$(gitmas_memory_api_key)"
+
+# Local dedup: skip if size hasn't grown since last successful upload for this
+# session. Stop hook fires after every assistant turn, so without this guard
+# we'd re-encrypt+upload an unchanged file on every fire.
+STATE_FILE="${GITMAS_SESSION_ARCHIVE_STATE:-$HOME/.gitmas/sessions/archive-state}"
+LAST_SIZE=$( { grep "^${SESSION_ID} " "$STATE_FILE" 2>/dev/null || true; } | awk '{print $2}' | tail -1)
+if [[ -n "$LAST_SIZE" && "$ORIGINAL_SIZE" -le "$LAST_SIZE" ]]; then
+  echo "  skip     ${SESSION_ID:0:8} (local: size=${ORIGINAL_SIZE} <= last=${LAST_SIZE})"
+  exit 0
+fi
+
+# Extract gist (first user prompt + count) for the dashboard. Failure here
+# is non-fatal — upload still proceeds without gist metadata.
+META_JSON=$(python3 - "$JSONL" <<'PY' 2>/dev/null || true
+import json, re, sys
+p = sys.argv[1]
+msgs = []
+ts = []
+
+def emit(first_msg, count, started, ended):
+    def to_dt(iso): return iso.replace('Z','').split('+')[0].split('.')[0].replace('T',' ')[:19]
+    print(json.dumps({
+        'gist': re.sub(r'\s+', ' ', first_msg).strip()[:240],
+        'count': count,
+        'started_at': to_dt(started) if started else '',
+        'ended_at': to_dt(ended) if ended else '',
+    }))
+
+# Hermes sessions are a single JSON document with a messages array.
+if '/.hermes/sessions/' in p:
+    d = json.load(open(p, encoding='utf-8', errors='replace'))
+    users = [m.get('content') for m in d.get('messages', [])
+             if isinstance(m, dict) and m.get('role') == 'user' and isinstance(m.get('content'), str) and m.get('content')]
+    if users:
+        emit(users[0], len(users), d.get('session_start') or '', d.get('last_updated') or '')
+    sys.exit(0)
+
+with open(p, 'r', encoding='utf-8', errors='replace') as f:
+    for line in f:
+        line = line.strip()
+        if not line: continue
+        try: e = json.loads(line)
+        except: continue
+        if e.get('timestamp'): ts.append(e['timestamp'])
+        msg = e.get('message', {}) if isinstance(e.get('message'), dict) else {}
+        payload = e.get('payload', {}) if isinstance(e.get('payload'), dict) else {}
+        c = None
+        if e.get('type') == 'user':
+            c = msg.get('content')
+        elif e.get('type') == 'message' and msg.get('role') == 'user':
+            c = msg.get('content')
+        elif e.get('type') == 'event_msg' and payload.get('type') == 'user_message':
+            c = payload.get('message')
+        if isinstance(c, str) and c and not c.startswith('[') and not c.startswith('<environment_context>'):
+            msgs.append(c)
+        elif isinstance(c, list):
+            parts=[]
+            for b in c:
+                if isinstance(b, dict):
+                    t = b.get('text') or b.get('content')
+                    if isinstance(t, str) and not t.startswith('<'):
+                        parts.append(t)
+            if parts:
+                msgs.append(' '.join(parts))
+def to_dt(iso): return iso.replace('Z','').split('+')[0].split('.')[0].replace('T',' ')[:19]
+if msgs:
+    first = re.sub(r'\s+', ' ', msgs[0]).strip()[:240]
+    print(json.dumps({
+        'gist': first,
+        'count': len(msgs),
+        'started_at': to_dt(ts[0]) if ts else '',
+        'ended_at': to_dt(ts[-1]) if ts else '',
+    }))
+PY
+)
+GIST=""
+COUNT=0
+STARTED_AT=""
+ENDED_AT=""
+if [[ -n "$META_JSON" ]]; then
+  GIST=$(echo "$META_JSON" | python3 -c "import json,sys;print(json.load(sys.stdin)['gist'])" 2>/dev/null || true)
+  COUNT=$(echo "$META_JSON" | python3 -c "import json,sys;print(json.load(sys.stdin)['count'])" 2>/dev/null || echo 0)
+  STARTED_AT=$(echo "$META_JSON" | python3 -c "import json,sys;print(json.load(sys.stdin)['started_at'])" 2>/dev/null || true)
+  ENDED_AT=$(echo "$META_JSON" | python3 -c "import json,sys;print(json.load(sys.stdin)['ended_at'])" 2>/dev/null || true)
+fi
+
+# Compress + encrypt to temp file
+TMP="$(mktemp -t "sess-${SESSION_ID:0:8}-XXXX").jsonl.gz.age"
+trap 'rm -f "$TMP"' EXIT
+
+if ! gzip -c < "$JSONL" | age -e -r "$AGE_PUBKEY" > "$TMP"; then
+  echo "encryption failed for $SESSION_ID" >&2
+  exit 3
+fi
+
+TMP_SIZE="$(stat -f%z "$TMP" 2>/dev/null || stat -c%s "$TMP")"
+CHUNK_BYTES="${GITMAS_SESSION_CHUNK_BYTES:-8000000}"
+
+upload_regular() {
+  curl -sS --max-time 60 \
+    -H "X-API-Key: $API_KEY" \
+    --form-string "session_id=$SESSION_ID" \
+    --form-string "device_id=$DEVICE_ID" \
+    --form-string "device_name=$DEVICE_NAME" \
+    --form-string "project_dir=$PROJECT_DIR" \
+    --form-string "original_size=$ORIGINAL_SIZE" \
+    --form-string "format=gz.age" \
+    --form-string "gist=$GIST" \
+    --form-string "user_msg_count=$COUNT" \
+    --form-string "started_at=$STARTED_AT" \
+    --form-string "ended_at=$ENDED_AT" \
+    --form-string "overwrite=1" \
+    -F "file=@$TMP" \
+    "$API"
+}
+
+upload_chunked() {
+  local chunk_dir upload_id parts total idx part resp
+  chunk_dir="$(mktemp -d -t "sess-chunks-${SESSION_ID:0:8}-XXXX")"
+  upload_id="${SESSION_ID}-$(date +%s)-$$"
+  split -b "$CHUNK_BYTES" "$TMP" "$chunk_dir/part-"
+  parts=("$chunk_dir"/part-*)
+  total="${#parts[@]}"
+  idx=0
+  resp=""
+  for part in "${parts[@]}"; do
+    resp="$(curl -sS --max-time 90 \
+      -H "X-API-Key: $API_KEY" \
+      --form-string "session_id=$SESSION_ID" \
+      --form-string "device_id=$DEVICE_ID" \
+      --form-string "device_name=$DEVICE_NAME" \
+      --form-string "project_dir=$PROJECT_DIR" \
+      --form-string "original_size=$ORIGINAL_SIZE" \
+      --form-string "format=gz.age" \
+      --form-string "gist=$GIST" \
+      --form-string "user_msg_count=$COUNT" \
+      --form-string "started_at=$STARTED_AT" \
+      --form-string "ended_at=$ENDED_AT" \
+      --form-string "overwrite=1" \
+      --form-string "upload_id=$upload_id" \
+      --form-string "chunk_index=$idx" \
+      --form-string "chunk_total=$total" \
+      --form-string "total_size=$TMP_SIZE" \
+      -F "file=@$part" \
+      "$CHUNK_API")" || { rm -rf "$chunk_dir"; return 1; }
+    if [[ "$idx" -lt $((total-1)) ]]; then
+      echo "$resp" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if d.get('status')=='ok' and d.get('action')=='chunk' else 1)" || { rm -rf "$chunk_dir"; echo "$resp"; return 1; }
+    fi
+    idx=$((idx+1))
+  done
+  rm -rf "$chunk_dir"
+  printf '%s\n' "$resp"
+}
+
+# Upload. Large encrypted archives use chunked upload so PHP multipart limits do
+# not decide whether a full session is saved.
+if [[ "$TMP_SIZE" -gt "$CHUNK_BYTES" ]]; then
+  RESPONSE="$(upload_chunked)"
+else
+  RESPONSE="$(upload_regular)"
+fi
+
+# Print compact JSON status, record successful upload to state file
+set +e
+echo "$RESPONSE" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    sid = '${SESSION_ID:0:8}'
+    if d.get('status') == 'ok' and d.get('action') == 'uploaded':
+        chunks = d.get('chunks')
+        suffix = f', chunks={chunks}' if chunks else ''
+        print(f'  uploaded {sid} ({d.get(\"compressed_size\",0)}b enc{suffix})')
+    elif d.get('status') == 'ok' and d.get('action') == 'skip':
+        print(f'  skip     {sid} (already on server, format={d.get(\"existing_format\",\"?\")})')
+    else:
+        print(f'  ERROR    {sid}: {d}')
+        sys.exit(4)
+except Exception as e:
+    print(f'  PARSE-ERR ${SESSION_ID:0:8}: {e}')
+    sys.exit(5)
+"
+UPLOAD_RC=$?
+set -e
+if [[ $UPLOAD_RC -eq 0 ]]; then
+  # Record latest successful size; keep file small by replacing existing line.
+  mkdir -p "$(dirname "$STATE_FILE")"
+  if [[ -f "$STATE_FILE" ]]; then
+    grep -v "^${SESSION_ID} " "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
+    mv "${STATE_FILE}.tmp" "$STATE_FILE"
+  fi
+  echo "${SESSION_ID} ${ORIGINAL_SIZE}" >> "$STATE_FILE"
+fi
+exit $UPLOAD_RC
