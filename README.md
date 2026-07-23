@@ -8,10 +8,12 @@ session history, recallable from any supported workflow, on any of your devices.
 One line (macOS / Linux):
 
 ```bash
-curl -fsSL https://www.gitmas.com/install.sh | bash
+GITMAS_API_KEY=<your key> bash -c "$(curl -fsSL https://www.gitmas.com/install.sh)"
 ```
 
-Or from this package:
+Or download a versioned package from the
+[releases page](https://github.com/KarlFlick/gitmas-memory/releases)
+(checksums in `SHA256SUMS`), extract, and run:
 
 ```bash
 GITMAS_API_KEY=<your key> ./install.sh
